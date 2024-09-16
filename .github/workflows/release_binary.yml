@@ -12,7 +12,7 @@ permissions: write-all
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     environment: release
     steps:
       - uses: actions/checkout@v4
@@ -39,3 +39,4 @@ jobs:
 
       - name: Release publish
         run: make release
+
