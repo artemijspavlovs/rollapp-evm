@@ -1,14 +1,16 @@
 package ante
 
 import (
+	errorsmod "cosmossdk.io/errors"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
 	authante "github.com/cosmos/cosmos-sdk/x/auth/ante"
 	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
 	"github.com/cosmos/cosmos-sdk/x/auth/types"
+	rdkante "github.com/dymensionxyz/dymension-rdk/server/ante"
 )
 
-type createAccountDecorator struct {
+type CreateAccountDecorator struct {
 	ak accountKeeper
 }
 
@@ -17,8 +19,8 @@ type accountKeeper interface {
 	NewAccountWithAddress(ctx sdk.Context, addr sdk.AccAddress) types.AccountI
 }
 
-func NewCreateAccountDecorator(ak accountKeeper) createAccountDecorator {
-	return createAccountDecorator{ak: ak}
+func NewCreateAccountDecorator(ak accountKeeper) CreateAccountDecorator {
+	return CreateAccountDecorator{ak: ak}
 }
 
 const newAccountCtxKeyPrefix = "new-account/"
@@ -27,10 +29,10 @@ func CtxKeyNewAccount(acc string) string {
 	return newAccountCtxKeyPrefix + acc
 }
 
-func (cad createAccountDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+func (cad CreateAccountDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
 	sigTx, ok := tx.(authsigning.SigVerifiableTx)
 	if !ok {
-		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid tx type")
+		return ctx, errorsmod.Wrap(sdkerrors.ErrTxDecode, "invalid tx type")
 	}
 
 	pubkeys, err := sigTx.GetPubKeys()
@@ -38,7 +40,7 @@ func (cad createAccountDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulat
 		return ctx, err
 	}
 
-	ibcRelayerMsg := isIBCRelayerMsg(tx.GetMsgs())
+	ibcRelayerMsg := rdkante.IsIBCRelayerMsg(tx.GetMsgs())
 
 	for i, pk := range pubkeys {
 		if pk == nil {

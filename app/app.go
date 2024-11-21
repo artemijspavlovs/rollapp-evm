@@ -7,19 +7,23 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/dymensionxyz/rollapp-evm/app/ante"
-
 	"github.com/cosmos/cosmos-sdk/x/authz"
 	authzkeeper "github.com/cosmos/cosmos-sdk/x/authz/keeper"
 	authzmodule "github.com/cosmos/cosmos-sdk/x/authz/module"
+	"github.com/gogo/protobuf/proto"
 	"github.com/gorilla/mux"
 	"github.com/rakyll/statik/fs"
 	"github.com/spf13/cast"
+	dbm "github.com/tendermint/tm-db"
+
 	abci "github.com/tendermint/tendermint/abci/types"
 	tmjson "github.com/tendermint/tendermint/libs/json"
 	"github.com/tendermint/tendermint/libs/log"
 	tmos "github.com/tendermint/tendermint/libs/os"
-	dbm "github.com/tendermint/tm-db"
+
+	"github.com/dymensionxyz/dymension-rdk/server/consensus"
+
+	"github.com/dymensionxyz/rollapp-evm/app/ante"
 
 	"github.com/cosmos/cosmos-sdk/baseapp"
 	"github.com/cosmos/cosmos-sdk/client"
@@ -81,6 +85,10 @@ import (
 	mintkeeper "github.com/dymensionxyz/dymension-rdk/x/mint/keeper"
 	minttypes "github.com/dymensionxyz/dymension-rdk/x/mint/types"
 
+	"github.com/dymensionxyz/dymension-rdk/x/timeupgrade"
+	timeupgradekeeper "github.com/dymensionxyz/dymension-rdk/x/timeupgrade/keeper"
+	timeupgradetypes "github.com/dymensionxyz/dymension-rdk/x/timeupgrade/types"
+
 	"github.com/dymensionxyz/dymension-rdk/x/epochs"
 	epochskeeper "github.com/dymensionxyz/dymension-rdk/x/epochs/keeper"
 	epochstypes "github.com/dymensionxyz/dymension-rdk/x/epochs/types"
@@ -100,7 +108,7 @@ import (
 	ibckeeper "github.com/cosmos/ibc-go/v6/modules/core/keeper"
 	ibctestingtypes "github.com/cosmos/ibc-go/v6/testing/types"
 
-	rollappparams "github.com/dymensionxyz/dymension-rdk/x/rollappparams"
+	"github.com/dymensionxyz/dymension-rdk/x/rollappparams"
 	rollappparamskeeper "github.com/dymensionxyz/dymension-rdk/x/rollappparams/keeper"
 	rollappparamstypes "github.com/dymensionxyz/dymension-rdk/x/rollappparams/types"
 
@@ -174,6 +182,8 @@ var (
 		// evmos keys
 		erc20types.StoreKey,
 		claimstypes.StoreKey,
+
+		timeupgradetypes.ModuleName,
 	}
 )
 
@@ -221,6 +231,8 @@ var (
 		vesting.AppModuleBasic{},
 		hubgenesis.AppModuleBasic{},
 		hub.AppModuleBasic{},
+		timeupgrade.AppModuleBasic{},
+
 		// Ethermint modules
 		evm.AppModuleBasic{},
 		feemarket.AppModuleBasic{},
@@ -310,7 +322,9 @@ type App struct {
 	IBCKeeper           *ibckeeper.Keeper // IBC Keeper must be a pointer in the app, so we can SetRouter on it correctly
 	TransferKeeper      transferkeeper.Keeper
 	FeeGrantKeeper      feegrantkeeper.Keeper
+	TimeUpgradeKeeper   timeupgradekeeper.Keeper
 	RollappParamsKeeper rollappparamskeeper.Keeper
+
 	// make scoped keepers public for test purposes
 	ScopedIBCKeeper      capabilitykeeper.ScopedKeeper
 	ScopedTransferKeeper capabilitykeeper.ScopedKeeper
@@ -331,6 +345,8 @@ type App struct {
 
 	// module configurator
 	configurator module.Configurator
+
+	consensusMessageAdmissionHandler consensus.AdmissionHandler
 }
 
 // NewRollapp returns a reference to an initialized blockchain app
@@ -473,17 +489,30 @@ func NewRollapp(
 			app.MintKeeper.Hooks(),
 		),
 	)
+	app.RollappParamsKeeper = rollappparamskeeper.NewKeeper(
+		app.GetSubspace(rollappparamstypes.ModuleName),
+	)
 
 	app.SequencersKeeper = *seqkeeper.NewKeeper(
-		appCodec, keys[seqtypes.StoreKey], app.GetSubspace(seqtypes.ModuleName),
+		appCodec,
+		keys[seqtypes.StoreKey],
+		app.GetSubspace(seqtypes.ModuleName),
+		authtypes.NewModuleAddress(seqtypes.ModuleName).String(),
+		app.AccountKeeper,
+		app.RollappParamsKeeper,
+		app.UpgradeKeeper,
+		[]seqkeeper.AccountBumpFilterFunc{
+			shouldBumpEvmAccountSequence,
+		},
+	)
+
+	app.TimeUpgradeKeeper = timeupgradekeeper.NewKeeper(
+		appCodec, keys[timeupgradetypes.StoreKey], authtypes.NewModuleAddress(govtypes.ModuleName).String(),
 	)
 
 	// ... other modules keepers
 	tracer := cast.ToString(appOpts.Get(srvflags.EVMTracer))
 
-	app.RollappParamsKeeper = rollappparamskeeper.NewKeeper(
-		app.GetSubspace(rollappparamstypes.ModuleName),
-	)
 	// Create Ethermint keepers
 	app.FeeMarketKeeper = feemarketkeeper.NewKeeper(
 		appCodec, authtypes.NewModuleAddress(govtypes.ModuleName),
@@ -556,6 +585,8 @@ func NewRollapp(
 		keys[hubgentypes.StoreKey],
 		app.GetSubspace(hubgentypes.ModuleName),
 		app.AccountKeeper,
+		app.BankKeeper,
+		app.MintKeeper,
 	)
 
 	app.HubKeeper = hubkeeper.NewKeeper(
@@ -563,20 +594,23 @@ func NewRollapp(
 		keys[hubtypes.StoreKey],
 	)
 
-	denomMetadataMiddleware := denommetadata.NewICS4Wrapper(
-		app.ClaimsKeeper,
+	var ics4Wrapper ibcporttypes.ICS4Wrapper
+	// The IBC tranfer submit is wrapped with the following middlewares:
+	// - denom metadata middleware
+	ics4Wrapper = denommetadata.NewICS4Wrapper(
+		app.IBCKeeper.ChannelKeeper,
 		app.HubKeeper,
 		app.BankKeeper,
 		app.HubGenesisKeeper.GetState,
 	)
-
-	genesisTransfersBlocker := hubgenkeeper.NewICS4Wrapper(denomMetadataMiddleware, app.HubGenesisKeeper) // ICS4 Wrapper: claims IBC middleware
+	// - genesis bridge - IBC transfer disabled until genesis bridge protocol completes
+	ics4Wrapper = hubgenkeeper.NewICS4Wrapper(ics4Wrapper, app.HubGenesisKeeper)
 
 	app.TransferKeeper = transferkeeper.NewKeeper(
 		appCodec,
 		keys[ibctransfertypes.StoreKey],
 		app.GetSubspace(ibctransfertypes.ModuleName),
-		genesisTransfersBlocker,
+		ics4Wrapper,
 		app.IBCKeeper.ChannelKeeper,
 		&app.IBCKeeper.PortKeeper,
 		app.AccountKeeper,
@@ -610,9 +644,9 @@ func NewRollapp(
 	transferStack = erc20.NewIBCMiddleware(app.Erc20Keeper, transferStack)
 	transferStack = hubgenkeeper.NewIBCModule(
 		transferStack,
-		app.TransferKeeper,
 		app.HubGenesisKeeper,
 		app.BankKeeper,
+		app.IBCKeeper.ChannelKeeper,
 	)
 
 	// Create static IBC router, add transfer route, then set and seal it
@@ -640,13 +674,14 @@ func NewRollapp(
 		mint.NewAppModule(appCodec, app.MintKeeper, app.AccountKeeper, app.BankKeeper),
 		distr.NewAppModule(appCodec, app.DistrKeeper, app.AccountKeeper, app.BankKeeper, app.StakingKeeper),
 		staking.NewAppModule(appCodec, app.StakingKeeper, app.AccountKeeper, app.BankKeeper),
-		sequencers.NewAppModule(appCodec, app.SequencersKeeper),
+		sequencers.NewAppModule(app.SequencersKeeper),
 		epochs.NewAppModule(appCodec, app.EpochsKeeper),
 		params.NewAppModule(app.ParamsKeeper),
 		ibc.NewAppModule(app.IBCKeeper),
 		upgrade.NewAppModule(app.UpgradeKeeper),
 		hubgenesis.NewAppModule(appCodec, app.HubGenesisKeeper),
 		hub.NewAppModule(appCodec, app.HubKeeper),
+		timeupgrade.NewAppModule(app.TimeUpgradeKeeper, app.UpgradeKeeper),
 		rollappparams.NewAppModule(appCodec, app.RollappParamsKeeper),
 		// Ethermint app modules
 		evm.NewAppModule(app.EvmKeeper, app.AccountKeeper, app.GetSubspace(evmtypes.ModuleName)),
@@ -666,6 +701,7 @@ func NewRollapp(
 	// NOTE: capability module's beginblocker must come before any modules using capabilities (e.g. IBC)
 	beginBlockersList := []string{
 		upgradetypes.ModuleName,
+		timeupgradetypes.ModuleName,
 		capabilitytypes.ModuleName,
 		minttypes.ModuleName,
 		feemarkettypes.ModuleName,
@@ -712,6 +748,7 @@ func NewRollapp(
 		epochstypes.ModuleName,
 		paramstypes.ModuleName,
 		upgradetypes.ModuleName,
+		timeupgradetypes.ModuleName,
 		ibchost.ModuleName,
 		ibctransfertypes.ModuleName,
 		hubgentypes.ModuleName,
@@ -747,6 +784,7 @@ func NewRollapp(
 
 		paramstypes.ModuleName,
 		upgradetypes.ModuleName,
+		timeupgradetypes.ModuleName,
 		ibctransfertypes.ModuleName,
 		feegrant.ModuleName,
 		hubgentypes.ModuleName,
@@ -811,9 +849,17 @@ func NewRollapp(
 		app.EvmKeeper,
 		app.IBCKeeper,
 		app.DistrKeeper,
+		app.SequencersKeeper,
 	)
 	app.SetAnteHandler(h)
 	app.setPostHandler()
+
+	// Admission handler for consensus messages
+	app.setAdmissionHandler(consensus.AllowedMessagesHandler([]string{
+		proto.MessageName(new(seqtypes.ConsensusMsgUpsertSequencer)),
+		proto.MessageName(new(seqtypes.MsgBumpAccountSequences)),
+		proto.MessageName(new(seqtypes.MsgUpgradeDRS)),
+	}))
 
 	if loadLatest {
 		if err := app.LoadLatestVersion(); err != nil {
@@ -838,12 +884,21 @@ func (app *App) setPostHandler() {
 	app.SetPostHandler(postHandler)
 }
 
+func (app *App) setAdmissionHandler(handler consensus.AdmissionHandler) {
+	app.consensusMessageAdmissionHandler = handler
+}
+
 // Name returns the name of the App
 func (app *App) Name() string { return app.BaseApp.Name() }
 
 // BeginBlocker application updates every begin block
 func (app *App) BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock) abci.ResponseBeginBlock {
-	return app.mm.BeginBlock(ctx, req)
+	consensusResponses := consensus.ProcessConsensusMessages(ctx, app.appCodec, app.consensusMessageAdmissionHandler, app.MsgServiceRouter(), req.ConsensusMessages)
+
+	resp := app.mm.BeginBlock(ctx, req)
+	resp.ConsensusMessagesResponses = consensusResponses
+
+	return resp
 }
 
 // EndBlocker application updates every end block
@@ -851,8 +906,8 @@ func (app *App) EndBlocker(ctx sdk.Context, req abci.RequestEndBlock) abci.Respo
 	rollappparams := app.RollappParamsKeeper.GetParams(ctx)
 	abciEndBlockResponse := app.mm.EndBlock(ctx, req)
 	abciEndBlockResponse.RollappParamUpdates = &abci.RollappParams{
-		Da:      rollappparams.Da,
-		Version: rollappparams.Version,
+		Da:         rollappparams.Da,
+		DrsVersion: rollappparams.DrsVersion,
 	}
 	return abciEndBlockResponse
 }
@@ -863,6 +918,10 @@ func (app *App) InitChainer(ctx sdk.Context, req abci.RequestInitChain) abci.Res
 	if err := tmjson.Unmarshal(req.AppStateBytes, &genesisState); err != nil {
 		panic(err)
 	}
+
+	genesisInfo := app.HubGenesisKeeper.GetGenesisInfo(ctx)
+	genesisInfo.GenesisChecksum = req.GenesisChecksum
+	app.HubGenesisKeeper.SetGenesisInfo(ctx, genesisInfo)
 
 	// Passing the dymint sequencers to the sequencer module from RequestInitChain
 	if len(req.Validators) == 0 {
@@ -1096,4 +1155,19 @@ func (app *App) setupUpgradeHandlers() {
 	if upgradeInfo.Name == UpgradeName && !app.UpgradeKeeper.IsSkipHeight(upgradeInfo.Height) {
 		app.SetStoreLoader(upgradetypes.UpgradeStoreLoader(upgradeInfo.Height, &storetypes.StoreUpgrades{}))
 	}
+}
+
+var evmAccountName = proto.MessageName(&ethermint.EthAccount{})
+
+func shouldBumpEvmAccountSequence(accountProtoName string, account authtypes.AccountI) (bool, error) {
+	if accountProtoName != evmAccountName {
+		return false, nil
+	}
+
+	evmAccount, ok := account.(*ethermint.EthAccount)
+	if !ok {
+		// this is really unlikely but let's create a nice error.
+		return false, fmt.Errorf("account is not an EVM account, but it has the same proto name: %T", account)
+	}
+	return evmAccount.Type() == ethermint.AccountTypeEOA, nil
 }
